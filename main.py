@@ -1,13 +1,18 @@
+import kucoin.exceptions
 from telethon import TelegramClient, events
 from kucoin.client import Client
-from kucoin.exceptions import KucoinAPIException
+from kucoin.exceptions import KucoinAPIException, MarketOrderException
+from kucoin.exceptions import LimitOrderException, KucoinRequestException
 import config
 import logging
+import _thread
 
 logging.basicConfig(format='[%(levelname) 5s/%(asctime)s] %(name)s: %(message)s',
                     level=logging.WARNING)
 
+panic_sell_flag = True
 pumped_coin = None
+symbol = None
 kucoin_client = None
 base_coin_amount = 0.0
 telegram_client = TelegramClient("peczi", config.TELEGRAM_ID, config.TELEGRAM_HASH)
@@ -29,6 +34,7 @@ async def get_chat_id():
 
 async def is_pumped_coin_inside(message):
     global pumped_coin
+    global symbol
     message_pattern = "Coin is:"
     ind = message.find(message_pattern)
     if ind == -1:
@@ -37,9 +43,10 @@ async def is_pumped_coin_inside(message):
     while not message[start_pos].isalnum():
         start_pos += 1
     end_pos = start_pos
-    while end_pos < len(message) and end_pos.isalnum():
+    while end_pos < len(message) and message[end_pos].isalnum():
         end_pos += 1
     pumped_coin = message[start_pos:end_pos]
+    symbol = "%s-%s" % (pumped_coin, config.COIN_USED_TO_PUMP)
     return True
 
 
@@ -101,9 +108,95 @@ def kucoin_initialize():
     return True
 
 
+# Pump section
+def last_price():
+    return float(kucoin_client.get_ticker(symbol)['price'])
+
+
+def get_panic_sell_start_signal():
+    global panic_sell_flag
+    input("Press ENTER to start panic selling coins.\n")
+    panic_sell_flag = False
+
+
+def panic_sell_signal_manually(profit):
+    want_to_sell = False
+    while not want_to_sell:
+        inp = input("Actual profit: %f%%. Confirm 's' to sell: " % profit(last_price()))
+        if inp == 's':
+            want_to_sell = True
+
+
+def get_coin_amount(coin):
+    for a in kucoin_client.get_accounts():
+        if a['currency'] == coin and a['type'] == 'trade':
+            return float(a['available'])
+    return 0.0
+
+
+def pump():
+    print("Pumped coin: %s" % pumped_coin)
+    print("Let's pump!")
+
+    # Market buy coins
+    print("Trying to market buy %s" % pumped_coin)
+    try:
+        market_buy = kucoin_client.create_market_order(symbol, Client.SIDE_BUY, funds=config.COINS)
+    except (KucoinAPIException, MarketOrderException, KucoinRequestException) as error:
+        print("Failed during trying market buy. Error message: %s" % error.message)
+        return False
+    market_order = kucoin_client.get_order(market_buy['orderId'])
+    bought_coins = float(market_order['dealSize'])
+    sold_coins = float(market_order['dealFunds'])
+    print("Successfully bought %f %s for %f %s" % (bought_coins, pumped_coin,
+                                                   sold_coins, config.COIN_USED_TO_PUMP))
+
+    # Limit sell coins
+    price = sold_coins / bought_coins
+    limit_price = price * (1 + config.EXPECTED_PROFIT / 100.0)
+    print(limit_price)
+    print("I'm trying to place limit sell order")
+    try:
+        kucoin_client.create_limit_order(symbol, Client.SIDE_SELL, limit_price, bought_coins)
+        print("Successfully placed limit sell with %f%% profit" % config.EXPECTED_PROFIT)
+    except (KucoinAPIException, LimitOrderException, KucoinRequestException) as error:
+        print("Failed during trying place limit sell. Error message: %s" % error.message)
+
+    def profit(x):
+        return (x - price) * 100 / price
+
+    # Multithreading for upgrade panic sell
+    try:
+        _thread.start_new_thread(get_panic_sell_start_signal, tuple())
+        while panic_sell_flag:
+            print("Actual profit: %f%%." % profit(last_price()))
+    except Exception:
+        print("Unable to start new thread.")
+        panic_sell_signal_manually(profit)
+
+    # Cancel all orders on pair
+    print("I'm trying to cancel all open orders on pair %s" % symbol)
+    try:
+        kucoin_client.cancel_all_orders(symbol)
+        print("All orders on pair %s cancelled" % symbol)
+    except (KucoinRequestException, KucoinAPIException) as error:
+        print("Cannot cancel orders on pair %s. Error message %s" % (symbol, error.message))
+
+    # Market sell coins
+    print("I'm trying to sell remaining amount of coins")
+    try:
+        kucoin_client.create_market_order(symbol, Client.SIDE_SELL, get_coin_amount(pumped_coin) * 0.99)
+        print("Successfully sold remaining coins")
+    except (MarketOrderException, KucoinRequestException, KucoinAPIException) as error:
+        print("Failed during trying market sell. Error message: %s" % error.message)
+
+    profit_in_percent = (get_coin_amount(config.COIN_USED_TO_PUMP) - base_coin_amount) * 100 / sold_coins
+    return "Successfully ended pump with %f%% profit" % profit_in_percent
+
+
 if __name__ == "__main__":
     if kucoin_initialize():
-        print("Successfully initialize kucoin client")
         get_pumped_coin()
         if pumped_coin is not None:
-            print(pumped_coin)
+            pump_results = pump()
+            print(pump_results)

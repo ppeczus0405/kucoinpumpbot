@@ -1,7 +1,7 @@
 # Specific for the project
 *.session*
 keys.py
-
+kucointest.py
 
 # Created by .ignore support plugin (hsz.mobi)
 ### Python template

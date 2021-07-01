@@ -14,6 +14,7 @@ panic_sell_flag = True
 pumped_coin = None
 symbol = None
 kucoin_client = None
+all_symbols = dict()
 base_coin_amount = 0.0
 telegram_client = TelegramClient("peczi", config.TELEGRAM_ID, config.TELEGRAM_HASH)
 
@@ -79,10 +80,24 @@ def get_pumped_coin():
 
 
 # Kucoin section
+def get_symbol_dict():
+    # Correction function for integer precisions
+    def correct(x):
+        if x.find(".") == -1:
+            return -len(x) + 1
+        return len(x) - 2
+
+    result = {}
+    for d in kucoin_client.get_symbols():
+        result[d['symbol']] = (correct(d['priceIncrement']),
+                               correct(d['baseIncrement']))
+    return result
+
+
 def kucoin_initialize():
     global kucoin_client
     global base_coin_amount
-
+    global all_symbols
     print("Initializing Kucoin client...")
     kucoin_client = Client(config.KUCOIN_KEY, config.KUCOIN_SECRET, config.KUCOIN_PASSCODE,
                            requests_params={"verify": True, "timeout": 20})
@@ -104,11 +119,22 @@ def kucoin_initialize():
         print("Check config file or transfer more funds on trading account.")
         return False
 
+    all_symbols = get_symbol_dict()
+
     print("Successfully initialize Kucoin client")
     return True
 
 
 # Pump section
+def include_precision(amount, precision):
+    r = 10 ** (-precision)
+    to_truncate = str(int(amount / r) * r)
+    dot_pos = to_truncate.find('.')
+    if dot_pos == -1:
+        return float(to_truncate)
+    return float(to_truncate[:dot_pos + precision + 1])
+
+
 def last_price():
     return float(kucoin_client.get_ticker(symbol)['price'])
 
@@ -135,26 +161,24 @@ def get_coin_amount(coin):
 
 
 def pump():
-    print("Pumped coin: %s" % pumped_coin)
-    print("Let's pump!")
-
-    # Market buy coins
-    print("Trying to market buy %s" % pumped_coin)
     try:
         market_buy = kucoin_client.create_market_order(symbol, Client.SIDE_BUY, funds=config.COINS)
     except (KucoinAPIException, MarketOrderException, KucoinRequestException) as error:
         print("Failed during trying market buy. Error message: %s" % error.message)
         return False
+
+    price_precision, pumped_coin_precision = all_symbols[symbol]
     market_order = kucoin_client.get_order(market_buy['orderId'])
-    bought_coins = float(market_order['dealSize'])
+    bought_coins = include_precision(float(market_order['dealSize']),
+                                     pumped_coin_precision)
     sold_coins = float(market_order['dealFunds'])
     print("Successfully bought %f %s for %f %s" % (bought_coins, pumped_coin,
                                                    sold_coins, config.COIN_USED_TO_PUMP))
 
     # Limit sell coins
     price = sold_coins / bought_coins
-    limit_price = price * (1 + config.EXPECTED_PROFIT / 100.0)
-    print(limit_price)
+    limit_price = include_precision(price * (1 + config.EXPECTED_PROFIT / 100.0),
+                                    price_precision)
     print("I'm trying to place limit sell order")
     try:
         kucoin_client.create_limit_order(symbol, Client.SIDE_SELL, limit_price, bought_coins)
@@ -185,18 +209,19 @@ def pump():
     # Market sell coins
     print("I'm trying to sell remaining amount of coins")
     try:
-        kucoin_client.create_market_order(symbol, Client.SIDE_SELL, get_coin_amount(pumped_coin) * 0.99)
+        market_sell_amount = include_precision(get_coin_amount(pumped_coin),
+                                               pumped_coin_precision)
+        kucoin_client.create_market_order(symbol, Client.SIDE_SELL, size=market_sell_amount)
         print("Successfully sold remaining coins")
     except (MarketOrderException, KucoinRequestException, KucoinAPIException) as error:
         print("Failed during trying market sell. Error message: %s" % error.message)
 
     profit_in_percent = (get_coin_amount(config.COIN_USED_TO_PUMP) - base_coin_amount) * 100 / sold_coins
-    return "Successfully ended pump with %f%% profit" % profit_in_percent
+    print("Successfully ended pump with %f%% profit" % profit_in_percent)
+    return True
 
 
 if __name__ == "__main__":
     if kucoin_initialize():
         get_pumped_coin()
-        if pumped_coin is not None:
-            pump_results = pump()
-            print(pump_results)
+        pump()
